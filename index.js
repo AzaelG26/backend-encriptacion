@@ -1,9 +1,10 @@
 const express = require('express');
 const http = require('http');
 const path = require('path');
-const os = require('os');
 const { Server } = require('socket.io');
 const { encrypt, decrypt, getKey } = require('./lib/encrypt');
+const { createUser, login, createSession, getSession } = require('./lib/auth');
+const { initDb } = require('./lib/db');
 const cors = require('cors');
 require('dotenv').config();
 
@@ -11,18 +12,47 @@ const app = express();
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-app.use(express.static(path.join(__dirname, '..', 'frontend-encriptacion')));
-
-const server = http.createServer(app);
-
-const io = new Server(server, {
-  cors: { origin: '*' },
-});
-
-// --- Rutas REST ---
+// --- Rutas API (antes de static para que /api/* siempre responda) ---
 
 app.get('/api/health', (req, res) => {
   res.send('Servidor de mensajería cifrada activo 🔐');
+});
+
+app.post('/api/register', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    const user = await createUser(username, password);
+    if (user.error) return res.status(400).json({ error: user.error });
+    const session = await createSession(user);
+    res.json(session);
+  } catch (e) {
+    console.error('Register error:', e);
+    res.status(500).json({ error: 'Error al registrar' });
+  }
+});
+
+app.post('/api/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    const user = await login(username, password);
+    if (user.error) return res.status(401).json({ error: user.error });
+    const session = await createSession(user);
+    res.json(session);
+  } catch (e) {
+    console.error('Login error:', e);
+    res.status(500).json({ error: 'Error al iniciar sesión' });
+  }
+});
+
+app.get('/api/me', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '') || req.query.token;
+    const session = await getSession(token);
+    if (!session) return res.status(401).json({ error: 'No autorizado' });
+    res.json({ user: session });
+  } catch (e) {
+    res.status(500).json({ error: 'Error al verificar sesión' });
+  }
 });
 
 /** Cifrar mensaje. POST /api/encrypt { "message": "texto" } */
@@ -59,7 +89,29 @@ app.get('/api/encryption-key', (req, res) => {
   res.json({ key: key.toString('base64') });
 });
 
-// --- Socket.IO: Chat cifrado ---
+// --- Servir frontend (después de todas las rutas /api) ---
+app.use(express.static(path.join(__dirname, '..', 'frontend-encriptacion')));
+
+const server = http.createServer(app);
+
+const io = new Server(server, {
+  cors: { origin: '*' },
+});
+
+// --- Socket.IO: requiere token y asocia usuario ---
+io.use(async (socket, next) => {
+  try {
+    const token = socket.handshake.auth?.token || socket.handshake.query?.token;
+    const session = await getSession(token);
+    if (!session) return next(new Error('No autorizado'));
+    socket.data.user = session;
+    next();
+  } catch (e) {
+    next(new Error('No autorizado'));
+  }
+});
+
+// --- Chat cifrado ---
 
 const MAX_HISTORY = 500;
 const messageHistory = [];
@@ -70,51 +122,63 @@ function addToHistory(envelope) {
 }
 
 io.on('connection', (socket) => {
-  console.log('Usuario conectado:', socket.id);
+  const { username } = socket.data.user;
+  console.log('Usuario conectado:', socket.id, username);
 
   socket.emit('encryption-key', { key: getKey().toString('base64') });
   socket.emit('chat:history', [...messageHistory]);
 
   socket.on('chat:send', (data) => {
-    let plain;
+    let envelope;
     try {
       if (data.encrypted != null && data.iv && data.authTag) {
-        plain = decrypt({ iv: data.iv, authTag: data.authTag, encrypted: data.encrypted });
+        decrypt({ iv: data.iv, authTag: data.authTag, encrypted: data.encrypted });
+        envelope = {
+          id: socket.id,
+          username,
+          encrypted: data.encrypted,
+          iv: data.iv,
+          authTag: data.authTag,
+          at: new Date().toISOString(),
+        };
       } else if (typeof data.message === 'string') {
-        plain = data.message;
+        const payload = encrypt(data.message);
+        envelope = {
+          id: socket.id,
+          username,
+          encrypted: payload.encrypted,
+          iv: payload.iv,
+          authTag: payload.authTag,
+          at: new Date().toISOString(),
+        };
       } else {
         return socket.emit('chat:error', { error: 'Envía { message } o { encrypted, iv, authTag }' });
       }
     } catch (e) {
       return socket.emit('chat:error', { error: 'Error al descifrar mensaje' });
     }
-
-    const payload = encrypt(plain);
-    const envelope = {
-      id: socket.id,
-      encrypted: payload.encrypted,
-      iv: payload.iv,
-      authTag: payload.authTag,
-      at: new Date().toISOString(),
-    };
     addToHistory(envelope);
     io.emit('chat:message', envelope);
   });
 
   socket.on('disconnect', () => {
-    console.log('Usuario desconectado:', socket.id);
+    console.log('Usuario desconectado:', socket.id, username);
   });
 });
 
-const PORT = 3000;
-server.listen(PORT, '0.0.0.0', () => {
-  console.log('Servidor en http://localhost:' + PORT + ' 🚀');
-  const ifaces = os.networkInterfaces();
-  for (const name of Object.keys(ifaces)) {
-    for (const iface of ifaces[name]) {
-      if (iface.family === 'IPv4' && !iface.internal) {
-        console.log('  Red local: http://' + iface.address + ':' + PORT + ' (comparte esta URL para que entren otros)');
-      }
-    }
+const PORT = process.env.PORT || 3000;
+
+async function start() {
+  try {
+    await initDb();
+    console.log('Base de datos MySQL conectada.');
+  } catch (e) {
+    console.error('Error al conectar con MySQL:', e.message);
+    process.exit(1);
   }
-});
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log('Servidor en http://localhost:' + PORT + ' 🚀');
+  });
+}
+
+start();

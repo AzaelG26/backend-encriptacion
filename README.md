@@ -4,14 +4,31 @@ Backend con Express + Socket.IO. Los mensajes se cifran al enviarse y se descifr
 
 ## Configuración
 
+### 1. Variables de entorno
+
 ```bash
 cp .env.example .env
-# Edita .env y define ENCRYPTION_KEY (32+ caracteres) en producción
+# Edita .env: ENCRYPTION_KEY (32+ caracteres) y credenciales de MySQL
+```
+
+### 2. MySQL
+
+Crea la base de datos y las tablas de una vez (un solo comando):
+
+```bash
+npm run init-db
+```
+
+Usa las variables de `.env`: `DB_HOST`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`. Si la base o las tablas ya existen, no las borra. Luego arranca el servidor con `npm start`.
+
+### 3. Arrancar
+
+```bash
 npm install
 npm start
 ```
 
-Servidor en `http://localhost:3000`. El frontend del chat se sirve en la raíz (`/`); abre **http://localhost:3000** en el navegador. Si ya tenías el servidor corriendo, reinícialo (`Ctrl+C` y `npm start`) para que sirva el frontend.
+Servidor en `http://localhost:3000`. El frontend (login/registro y chat) se sirve en la raíz (`/`). Las rutas `/api/*` se procesan antes que los archivos estáticos, así que `POST /api/register` y `POST /api/login` responden correctamente.
 
 ### Entrar desde otros dispositivos en tu red
 
@@ -27,13 +44,16 @@ Si no pueden conectar, revisa que el firewall de Windows permita entrantes en el
 
 | Método | Ruta | Body | Descripción |
 |--------|------|------|-------------|
+| POST | `/api/register` | `{ "username", "password" }` | Registro; devuelve `{ token, user }` |
+| POST | `/api/login` | `{ "username", "password" }` | Login; devuelve `{ token, user }` |
+| GET | `/api/me` | Header `Authorization: Bearer <token>` o `?token=` | Devuelve `{ user }` si el token es válido |
 | POST | `/api/encrypt` | `{ "message": "texto" }` | Devuelve `{ iv, authTag, encrypted }` |
 | POST | `/api/decrypt` | `{ "iv", "authTag", "encrypted" }` | Devuelve `{ "message": "..." }` |
 | GET | `/api/encryption-key` | - | Clave en base64 (solo para demo; no exponer en producción) |
 
 ## Socket.IO (chat)
 
-- **Conectar:** `io.connect('http://localhost:3000')`
+- **Conectar:** `io.connect('http://localhost:3000', { auth: { token: '<token>' } })` — el token se obtiene de `/api/login` o `/api/register`.
 - **Al conectar:** el servidor emite `encryption-key` con `{ key }` (base64) para cifrar/descifrar en el cliente.
 - **Enviar mensaje:** emite `chat:send` con uno de:
   - `{ "message": "texto plano" }` → el servidor cifra y reenvía.
